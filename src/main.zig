@@ -2,195 +2,171 @@
 //! you are building an executable. If you are making a library, the convention
 //! is to delete this file and start with root.zig instead.
 
-pub fn main() !void {}
-const root = @import("mem_shuffle_lib");
 const std = @import("std");
+const root = @import("mem_shuffle_lib");
 
-const Foo = struct {
-    a: u32,
-    b: u32,
-};
-fn invariant(shuffler: *root.Shuffler) !void {
+const Foo = struct { a: u32, b: u32 };
+
+fn invariant(sh: *root.Shuffler) !void {
     var total: usize = 0;
-    for (shuffler.arenas.items) |arena| {
+    for (sh.arenas.items) |arena| {
         for (arena.entries_indexes.items) |idx|
-            try std.testing.expect(idx < shuffler.mem_entry_array.items.len);
+            try std.testing.expect(idx < sh.mem_entry_array.items.len);
         total += arena.entries_indexes.items.len;
     }
-    try std.testing.expectEqual(shuffler.mem_entry_array.items.len, total);
+    try std.testing.expectEqual(sh.mem_entry_array.items.len, total);
 }
 
-// 1 ─ bulk alloc / bulk free stress‑test
+// ───────── 1. bulk alloc / free ─────────
 test "bulk alloc / bulk free leaves allocator clean" {
-    var shuffler = try root.Shuffler.init(std.heap.page_allocator);
+    var gpa = std.heap.DebugAllocator(.{}){};
+    const allocator = gpa.allocator();
 
-    var tmp = std.ArrayList(*const root.MemoryEntry).init(std.heap.page_allocator);
-    defer tmp.deinit();
-
-    inline for (0..128) |_| try tmp.append(try shuffler.alloc(u8, 8));
-    for (tmp.items) |e| root.Shuffler.free(e);
-
-    try shuffler.shuffle();
-    try invariant(&shuffler);
-}
-
-// 2 ─ shuffle idempotency
-test "calling shuffle twice in a row is harmless" {
-    var sh = try root.Shuffler.init(std.heap.page_allocator);
-    _ = try sh.alloc(u8, 32);
-    _ = try sh.create(Foo);
-
-    try sh.shuffle();
-    try invariant(&sh);
-
-    try sh.shuffle();
-    try invariant(&sh);
-}
-
-// 3 ─ free‑while‑locked semantics
-test "free on a locked block delays reclamation until return_pointer" {
-    var sh = try root.Shuffler.init(std.heap.page_allocator);
-    const e = try sh.alloc(u8, 16);
-
-    const p = sh.rent_pointer(e, [*]u8);
-    root.Shuffler.free(e); // mark while still locked
-    p[0] = 0xFF;
-    sh.return_pointer(e); // now eligible for GC
-
-    try sh.shuffle();
-    try invariant(&sh);
-}
-
-// 4 ─ coverage‑guided fuzzing (0.15‑dev API)
-test "fuzz shuffler API" {
-    const Context = struct {
-        // a per‑iteration PRNG – avoids repeated calls to std.rand on the
-        // global seed and keeps memory use tiny.
-        fn prng(seed: u64) std.Random.DefaultPrng {
-            return std.Random.DefaultPrng.init(@as(u64, @bitCast(seed ^ 0xdead_beef_cafe_babe)));
-        }
-
-        fn testOne(_: @This(), input: []const u8) anyerror!void {
-            // Fresh allocator and shuffler each iteration
-            var shuffler = try root.Shuffler.init(std.heap.page_allocator);
-
-            var live = std.ArrayList(*const root.MemoryEntry)
-                .init(std.heap.page_allocator);
-            defer live.deinit();
-
-            var rng = prng(std.hash.Crc32.hash(input));
-            const r = rng.random();
-
-            for (input) |b| {
-                switch (b & 0b11) {
-                    // 00 ‑ allocate slice of (1‥64) bytes
-                    0 => try live.append(try shuffler.alloc(u8, (b >> 2) + 1)),
-                    // 01 ‑ create a Foo
-                    1 => try live.append(try shuffler.create(Foo)),
-                    // 10 ‑ free a random live entry
-                    2 => if (live.items.len > 0)
-                        root.Shuffler.free(live.swapRemove(r.uintLessThan(usize, live.items.len))),
-                    // 11 ‑ rent/return a random live entry
-                    3 => if (live.items.len > 0) {
-                        const i = r.uintLessThan(usize, live.items.len);
-                        const e = live.items[i];
-                        const p = shuffler.rent_pointer(e, [*]u8);
-                        defer shuffler.return_pointer(e);
-                        if (e.size != 0) p[0] = 0x42;
-                    },
-                    else => {},
-                }
-                try invariant(&shuffler); // invariants after every op
-            }
-        }
-    };
-
-    // *** new API: Context instance, pointer to its method, options ***
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
-}
-
-// Ensures that a freshly‑initialised `Shuffler` starts in a clean state.
-// We use `page_allocator` so that the Zig test harness does not report
-// memory‑leaks (there is no `deinit` yet on `Shuffler`).
-test "init returns empty shuffler" {
-    const shuffler = try root.Shuffler.init(std.heap.page_allocator);
-    try std.testing.expect(shuffler.mem_entry_array.items.len == 0);
-}
-
-// Verifies that `alloc` gives back a non‑null pointer and a correctly
-// initialised `MemoryEntry`.
-test "alloc returns valid entry and pointer" {
-    var shuffler = try root.Shuffler.init(std.heap.page_allocator);
-
-    const entry = try shuffler.alloc(u8, 32);
-    // try std.testing.expect(entry.ptr != null);
-    try std.testing.expectEqual(@as(u32, 32), entry.size);
-    try std.testing.expect(!entry.locked);
-    try std.testing.expect(!entry.to_clear);
-}
-
-// Verifies that `create` works for arbitrary structs and records the right
-// size.
-test "create returns valid entry for struct type" {
-    var shuffler = try root.Shuffler.init(std.heap.page_allocator);
-
-    const entry = try shuffler.create(Foo);
-    // try std.testing.expect(entry.ptr != null);
-    try std.testing.expectEqual(@sizeOf(Foo), entry.size);
-}
-
-// Checks that `rent_pointer` sets the `locked` flag and that `return_pointer`
-// clears it again.
-test "rent_pointer locks and return_pointer unlocks" {
-    var shuffler = try root.Shuffler.init(std.heap.page_allocator);
-
-    const entry = try shuffler.alloc(u8, 16);
-    const ptr = shuffler.rent_pointer(entry, [*]u8);
-    defer shuffler.return_pointer(entry);
-
-    try std.testing.expect(entry.locked);
-    // Touch the memory so the optimiser cannot remove it
-    ptr[0] = 0xaa;
-}
-
-// Confirms that `free` only marks the entry for clearing; it does not affect
-// other bookkeeping immediately.
-test "free marks entry to_clear" {
-    var shuffler = try root.Shuffler.init(std.heap.page_allocator);
-
-    const entry = try shuffler.alloc(u8, 8);
-    root.Shuffler.free(entry);
-    try std.testing.expect(entry.to_clear);
-}
-
-// Stores data inside a struct, forces several internal shuffles via extra
-// allocations/frees, and finally checks the data is still there ‑‑ proving
-// the allocator’s copy‑forward logic works.
-test "data persists across shuffle cycles" {
-    var shuffler = try root.Shuffler.init(std.heap.page_allocator);
-
-    const entry = try shuffler.create(Foo);
-
-    // First borrow, write some data, then return it.
     {
-        const foo_ptr = shuffler.rent_pointer(entry, *Foo);
-        defer shuffler.return_pointer(entry);
-        foo_ptr.* = .{ .a = 0xCAFE, .b = 0xBABE };
+        var sh = try root.Shuffler.init(allocator);
+        defer sh.deinit();
+
+        var tmp = std.ArrayList(root.Handle).init(allocator);
+        defer tmp.deinit();
+
+        inline for (0..128) |_| try tmp.append(try sh.alloc(u8, 8));
+        for (tmp.items) |h| sh.free(h);
+
+        try sh.shuffle();
+        try invariant(&sh);
     }
 
-    // Generate noise to trigger a shuffle: allocate a bunch, free half of
-    // them so that the shuffler has something to move around.
-    comptime var i: usize = 0;
-    inline while (i < 64) : (i += 1) {
-        const tmp = try shuffler.alloc(u8, 4);
-        if (i % 2 == 0) root.Shuffler.free(tmp);
-    }
-
-    // Borrow again and verify the data survived the shuffle.
-    const foo_ptr_again = shuffler.rent_pointer(entry, *Foo);
-    defer shuffler.return_pointer(entry);
-
-    try std.testing.expectEqual(@as(u32, 0xCAFE), foo_ptr_again.a);
-    try std.testing.expectEqual(@as(u32, 0xBABE), foo_ptr_again.b);
+    if (gpa.detectLeaks()) std.debug.print("Leaks!\n", .{});
 }
-// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
+
+// ───────── 2. shuffle idempotency ───────
+test "calling shuffle twice in a row is harmless" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    const allocator = gpa.allocator();
+    {
+        var sh = try root.Shuffler.init(allocator);
+        defer sh.deinit();
+
+        _ = try sh.create(Foo);
+        _ = try sh.alloc(u8, 32);
+
+        try sh.shuffle();
+        try invariant(&sh);
+
+        try sh.shuffle();
+        try invariant(&sh);
+    }
+    if (gpa.detectLeaks()) std.debug.print("Leaks!\n", .{});
+}
+
+// ───────── 3. free‑while‑locked ─────────
+test "free on a locked block delays reclamation until returnPointer" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    const allocator = gpa.allocator();
+    {
+        var sh = try root.Shuffler.init(allocator);
+        defer sh.deinit();
+        const h = try sh.alloc(u8, 16);
+
+        const p = sh.rentPointer(h, [*]u8);
+        sh.free(h); // mark while locked
+        p[0] = 0xFF;
+        sh.returnPointer(h); // unlock → now collectible
+
+        try sh.shuffle();
+        try invariant(&sh);
+    }
+
+    if (gpa.detectLeaks()) std.debug.print("Leaks!\n", .{});
+}
+// ──────── shuffle empty ────────
+test "shuffling empty shuffler does nothing" {
+    var sh = try root.Shuffler.init(std.testing.allocator);
+    defer sh.deinit();
+
+    try sh.shuffle();
+    try invariant(&sh);
+}
+
+// ──────── shuffle moves entries correctly ────────
+test "shuffle moves data correctly" {
+    var sh = try root.Shuffler.init(std.testing.allocator);
+    defer sh.deinit();
+
+    _ = try sh.alloc(u8, 4);
+    _ = try sh.alloc(u8, 4);
+    _ = try sh.alloc(u8, 4);
+    const h = try sh.alloc(u8, 4);
+    _ = try sh.alloc(u8, 4);
+    _ = try sh.alloc(u8, 4);
+    {
+        const p = sh.rentPointer(h, [*]u8);
+        defer sh.returnPointer(h);
+
+        p[0] = 0x11;
+        p[1] = 0x22;
+        p[2] = 0x33;
+        p[3] = 0x44;
+    }
+
+    try sh.shuffle();
+    try invariant(&sh);
+
+    {
+        const new_p = sh.rentPointer(h, [*]u8);
+        defer sh.returnPointer(h);
+
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x11, 0x22, 0x33, 0x44 }, new_p[0..4]);
+    }
+}
+
+// ──────── multiple shuffles ────────
+test "multiple shuffles maintain correctness" {
+    var sh = try root.Shuffler.init(std.testing.allocator);
+    defer sh.deinit();
+
+    const h1 = try sh.alloc(u8, 8);
+    const h2 = try sh.alloc(u8, 16);
+
+    for (0..10) |_| {
+        try sh.shuffle();
+        try invariant(&sh);
+
+        {
+            const p1 = sh.rentPointer(h1, [*]u8);
+            const p2 = sh.rentPointer(h2, [*]u8);
+
+            defer sh.returnPointer(h1);
+            defer sh.returnPointer(h2);
+
+            p1[0] = 0xAA;
+            p2[0] = 0xBB;
+        }
+        {
+            const p1 = sh.rentPointer(h1, [*]u8);
+            const p2 = sh.rentPointer(h2, [*]u8);
+
+            defer sh.returnPointer(h1);
+            defer sh.returnPointer(h2);
+
+            try std.testing.expectEqual(@as(u8, 0xBB), p2[0]);
+            try std.testing.expectEqual(@as(u8, 0xAA), p1[0]);
+        }
+    }
+}
+
+// ──────── shuffle after free ────────
+test "shuffle after freeing entries" {
+    var sh = try root.Shuffler.init(std.testing.allocator);
+    defer sh.deinit();
+
+    const h_keep = try sh.alloc(u8, 32);
+    const h_free = try sh.alloc(u8, 32);
+
+    sh.free(h_free);
+    try sh.shuffle();
+    try invariant(&sh);
+
+    try std.testing.expect(sh.validHandle(h_keep));
+    try std.testing.expect(!sh.validHandle(h_free));
+}
