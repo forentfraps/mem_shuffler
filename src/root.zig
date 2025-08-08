@@ -1,19 +1,26 @@
 const std = @import("std");
 
-pub const Handle = usize; // index inside `mem_entry_array`
-pub const Invalid = std.math.maxInt(Handle); // 0xFFFF_FFFF sentinel
+const Aes256 = std.crypto.core.aes.Aes256;
+const AesEnc = std.crypto.core.aes.AesEncryptCtx(Aes256);
+const AesDec = std.crypto.core.aes.AesDecryptCtx(Aes256);
+
+pub const Handle = usize;
+pub const Invalid = std.math.maxInt(Handle);
 
 pub const MemoryEntry = struct {
     ptr: *anyopaque,
     size: usize,
+    alignment: u29 = 1,
     handle: Handle,
-    locked: bool,
-    to_clear: bool,
+    locked: bool = false,
+    to_clear: bool = false,
+    encrypted: bool = false,
 };
 
 const MemArena = struct {
     arena: *std.heap.ArenaAllocator,
-    entries_indexes: std.ArrayList(usize),
+    /// Maps a MemoryEntry's handle -> void just to track membership
+    entries: std.AutoHashMap(Handle, void),
     stale: bool = false,
     empty: bool = true,
 
@@ -24,142 +31,65 @@ const MemArena = struct {
 
 pub const Shuffler = struct {
     parent_allocator: std.mem.Allocator,
-    mem_entry_array: std.ArrayList(MemoryEntry),
+    /// Global table holding every live MemoryEntry keyed by its Handle
+    mem_entries: std.AutoHashMap(Handle, MemoryEntry),
+    /// All arenas the shuffler can use
     arenas: std.ArrayList(MemArena),
+    /// Index into 'arenas'
     active_arena: usize = 0,
-    handle_to_index: std.AutoHashMap(Handle, usize),
-    rng: std.Random,
+    /// Monotonically–increasing counter for new handles
+    next_handle: Handle = 0,
+    /// Aes context and related stuff to encrypt and decrypt
+    aesenc: AesEnc = undefined,
+    aesdec: AesDec = undefined,
+    ctr_salt: [8]u8 = undefined,
 
     const Self = @This();
 
     // ──────────────────────────── construction ──────────────────────────────
     pub fn init(allocator: std.mem.Allocator) !Self {
-        var seed: u64 = undefined;
-        std.Random.bytes(std.crypto.random, (@as([*]u8, @ptrCast(&seed))[0..8]));
-        var prng = std.Random.DefaultPrng.init(seed);
+        var key: [32]u8 = undefined;
+        std.crypto.random.bytes(@as([*]u8, @ptrCast(&key))[0..32]);
+        var salt: [8]u8 = undefined;
+        std.crypto.random.bytes(&salt);
+
         return .{
             .parent_allocator = allocator,
-            .mem_entry_array = std.ArrayList(MemoryEntry).init(allocator),
+            .mem_entries = std.AutoHashMap(Handle, MemoryEntry).init(allocator),
             .arenas = std.ArrayList(MemArena).init(allocator),
-            .handle_to_index = std.AutoHashMap(Handle, usize).init(allocator),
-            .rng = prng.random(),
+            .active_arena = 0,
+            .next_handle = 0,
+            .aesenc = Aes256.initEnc(key),
+            .aesdec = Aes256.initDec(key),
+            .ctr_salt = salt,
         };
     }
+
     pub fn deinit(self: *Self) void {
-        for (self.arenas.items) |*arena_entry| {
-            arena_entry.arena.deinit();
-            self.parent_allocator.destroy(arena_entry.arena);
-            arena_entry.entries_indexes.deinit();
+        // free arena memory
+        for (self.arenas.items) |*arena| {
+            arena.entries.deinit();
+            arena.arena.deinit();
+            self.parent_allocator.destroy(arena.arena);
         }
-
         self.arenas.deinit();
-
-        self.mem_entry_array.deinit();
-        self.handle_to_index.deinit();
+        self.mem_entries.deinit();
     }
 
-    pub fn newHandle(self: *Self) Handle {
-        var h: Handle = Invalid;
-        while (h == Invalid or self.validHandle(h)) {
-            h = self.rng.int(usize);
-        }
+    // ─────────────────────────────── handles ────────────────────────────────
+    fn newHandle(self: *Self) Handle {
+        // Never hand out the Invalid sentinel
+        if (self.next_handle == Invalid) self.next_handle += 1;
+        const h: Handle = self.next_handle;
+        self.next_handle += 1;
         return h;
     }
+
     pub fn validHandle(self: *Self, h: Handle) bool {
-        return self.handle_to_index.contains(h);
+        return self.mem_entries.contains(h);
     }
 
-    // ────────────────────────────── allocation ──────────────────────────────
-    /// allocate `n` elements of `T`
-    pub fn alloc(self: *Self, T: type, n: usize) !Handle {
-        if (n == 0) @panic("alloc(0‑byte)");
-
-        const arena_idx = try self.getArenaIndex();
-        const ptr = try self.arenas.items[arena_idx].allocator().alloc(T, n);
-
-        // reserve one slot and remember its index
-        const entry_idx = self.mem_entry_array.items.len;
-        try self.mem_entry_array.append(undefined);
-        const entry = &self.mem_entry_array.items[entry_idx];
-
-        const h = self.newHandle();
-
-        entry.* = .{
-            .ptr = ptr.ptr,
-            .size = n,
-            .handle = h,
-            .locked = false,
-            .to_clear = false,
-        };
-
-        try self.handle_to_index.put(h, entry_idx);
-
-        var arena = &self.arenas.items[arena_idx]; // reacquire after allocations
-        arena.empty = false;
-        try arena.entries_indexes.append(entry_idx);
-
-        return h;
-    }
-
-    /// create one `T`
-    pub fn create(self: *Self, T: type) !Handle {
-        if (@sizeOf(T) == 0) @panic("alloc(0‑byte)");
-
-        const arena_idx = try self.getArenaIndex();
-        const ptr = try self.arenas.items[arena_idx].allocator().create(T);
-
-        // reserve one slot and remember its index
-        const entry_idx = self.mem_entry_array.items.len;
-        try self.mem_entry_array.append(undefined);
-        const entry = &self.mem_entry_array.items[entry_idx];
-
-        const h = self.newHandle();
-
-        entry.* = .{
-            .ptr = ptr,
-            .size = @sizeOf(T),
-            .handle = h,
-            .locked = false,
-            .to_clear = false,
-        };
-
-        try self.handle_to_index.put(h, entry_idx);
-
-        var arena = &self.arenas.items[arena_idx]; // reacquire after allocations
-        arena.empty = false;
-        try arena.entries_indexes.append(entry_idx);
-
-        return h;
-    }
-    // ───────────────────────────────  free  ─────────────────────────────────
-    pub fn free(self: *Self, h: Handle) void {
-        if (!self.validHandle(h)) return;
-        const entry_index = self.handle_to_index.get(h).?;
-        self.mem_entry_array.items[entry_index].to_clear = true;
-    }
-
-    // ─────────────────────── rent / return a typed pointer ──────────────────
-    pub fn rentPointer(self: *Self, h: Handle, P: type) P {
-        if (@typeInfo(P) != .pointer)
-            @compileError("rentPointer needs a pointer type");
-        self.shuffle() catch |e| @panic(@errorName(e));
-
-        const entry_index = self.handle_to_index.get(h).?;
-        const entry = &self.mem_entry_array.items[entry_index];
-        entry.locked = true;
-        return @as(P, @ptrCast(@alignCast(entry.ptr)));
-    }
-
-    pub fn returnPointer(self: *Self, h: Handle) void {
-        if (!self.validHandle(h)) return;
-        const entry_index = self.handle_to_index.get(h).?;
-        const entry = &self.mem_entry_array.items[entry_index];
-        entry.locked = false;
-        self.shuffle() catch |e| @panic(@errorName(e));
-    }
-
-    // ───────────────────────── internal helpers ─────────────────────────────
-
+    // ───────────────────────────── arenas ───────────────────────────────────
     fn getArenaIndex(self: *Self) !usize {
         if (self.arenas.items.len == 0)
             try self.makeArena();
@@ -167,119 +97,221 @@ pub const Shuffler = struct {
     }
 
     fn makeArena(self: *Self) !void {
-        const arena_slot = try self.arenas.addOne(); // ← uninitialised memory
-
+        const slot = try self.arenas.addOne();
         const arena_ptr = try self.parent_allocator.create(std.heap.ArenaAllocator);
         arena_ptr.* = std.heap.ArenaAllocator.init(self.parent_allocator);
 
-        arena_slot.* = .{
+        slot.* = .{
             .arena = arena_ptr,
-            .entries_indexes = std.ArrayList(usize).init(self.parent_allocator),
+            .entries = std.AutoHashMap(Handle, void).init(self.parent_allocator),
             .stale = false,
             .empty = true,
         };
 
         self.active_arena = self.arenas.items.len - 1;
-        // return arena_slot;
     }
+
+    // ────────────────────────────── allocation ──────────────────────────────
+    pub fn alloc(self: *Self, comptime T: type, n: usize) !Handle {
+        if (n == 0) @panic("alloc(0‑byte)");
+
+        const arena_idx = try self.getArenaIndex();
+        const ptr = try self.arenas.items[arena_idx].allocator().alloc(T, n);
+
+        const h = self.newHandle();
+
+        try self.mem_entries.put(h, .{
+            .ptr = ptr.ptr,
+            .size = n * @sizeOf(T),
+            .alignment = @alignOf(T),
+            .handle = h,
+            .locked = false,
+            .to_clear = false,
+        });
+
+        try self.arenas.items[arena_idx].entries.put(h, {});
+
+        self.arenas.items[arena_idx].empty = false;
+        return h;
+    }
+
+    pub fn create(self: *Self, comptime T: type) !Handle {
+        if (@sizeOf(T) == 0) @panic("alloc(0‑byte)");
+
+        const arena_idx = try self.getArenaIndex();
+        const ptr = try self.arenas.items[arena_idx].allocator().create(T);
+
+        const h = self.newHandle();
+
+        try self.mem_entries.put(h, .{
+            .ptr = ptr,
+            .size = @sizeOf(T),
+            .alignment = @alignOf(T),
+            .handle = h,
+            .locked = false,
+            .to_clear = false,
+        });
+
+        try self.arenas.items[arena_idx].entries.put(h, {});
+        self.arenas.items[arena_idx].empty = false;
+        return h;
+    }
+
+    // ─────────────────────────────── free ───────────────────────────────────
+    pub fn free(self: *Self, h: Handle) void {
+        if (!self.validHandle(h)) return;
+        self.mem_entries.getPtr(h).?.to_clear = true;
+    }
+
+    // ─────────────────────── rent / return a typed pointer ──────────────────
+    pub fn rentPointer(self: *Self, h: Handle, comptime P: type) P {
+        if (@typeInfo(P) != .pointer)
+            @compileError("rentPointer needs a pointer type");
+
+        self.shuffle() catch unreachable;
+
+        const entry = self.mem_entries.getPtr(h) orelse @panic("Invalid handle");
+        entry.locked = true;
+        self.decrypt_mementry(entry);
+        entry.encrypted = false;
+        return @as(P, @ptrCast(@alignCast(entry.ptr)));
+    }
+
+    pub fn returnPointer(self: *Self, h: Handle) void {
+        if (!self.validHandle(h)) return;
+        const entry = self.mem_entries.getPtr(h).?;
+        self.encrypt_mementry(entry);
+        entry.encrypted = true;
+        entry.locked = false;
+        self.shuffle() catch unreachable;
+    }
+
     pub fn getSize(self: *Self, h: Handle) usize {
-        if (!self.validHandle(h)) @panic("Invalid handle");
-        const entry_index = self.handle_to_index.get(h).?;
-        const entry = &self.mem_entry_array.items[entry_index];
+        const entry = self.mem_entries.get(h) orelse @panic("Invalid handle");
         return entry.size;
     }
-    pub fn shuffle(self: *Self) !void {
-        if (self.mem_entry_array.items.len == 0) return;
-        var unlocked_entry_list = std.ArrayList(usize).init(self.parent_allocator);
-        defer unlocked_entry_list.deinit();
 
-        var to_clear_list = std.ArrayList(usize).init(self.parent_allocator);
-        defer to_clear_list.deinit();
+    // ────────────────────────────  shuffle  ────────────────────────────────
+    pub fn shuffle(self: *Self) !void {
+        if (self.mem_entries.count() == 0) return;
+
+        var unlocked = std.ArrayList(Handle).init(self.parent_allocator);
+        defer unlocked.deinit();
+
+        var to_clear = std.ArrayList(Handle).init(self.parent_allocator);
+        defer to_clear.deinit();
 
         var arenas_to_reset = std.ArrayList(usize).init(self.parent_allocator);
         defer arenas_to_reset.deinit();
 
-        var empty_arena_index: ?usize = null;
-        for (self.arenas.items, 0..) |*arena_entry, arena_index| {
-            var freed_entries: usize = 0;
-            var to_remove = std.ArrayList(usize).init(self.parent_allocator);
-            defer to_remove.deinit();
-            for (arena_entry.entries_indexes.items, 0..) |memory_entry_index, i| {
-                const memory_entry = self.mem_entry_array.items[memory_entry_index];
-                if (!memory_entry.locked) {
-                    try to_remove.append(i);
-                    if (memory_entry.to_clear) {
-                        try to_clear_list.append(memory_entry_index);
-                        freed_entries += 1;
+        // Collect unlocked or to‑clear entries from each arena
+        for (self.arenas.items, 0..) |*arena, idx| {
+            var iter = arena.entries.keyIterator();
+            while (iter.next()) |handle_ptr| {
+                const h = handle_ptr.*;
+                const entry = self.mem_entries.getPtr(h).?;
+                if (!entry.locked) {
+                    // remove from arena tracking – we will move or delete later
+                    _ = arena.entries.remove(h);
+                    if (entry.to_clear) {
+                        try to_clear.append(h);
                     } else {
-                        try unlocked_entry_list.append(memory_entry_index);
+                        try unlocked.append(h);
                     }
                 }
             }
-            if (arena_entry.entries_indexes.items.len - freed_entries != to_remove.items.len) {
-                arena_entry.stale = true;
-                arena_entry.empty = false;
+
+            if (arena.entries.count() == 0) {
+                arena.empty = true;
+                try arenas_to_reset.append(idx);
             } else {
-                arena_entry.stale = false;
-                arena_entry.empty = true;
-                try arenas_to_reset.append(arena_index);
-                if (arena_index != 0) {
-                    empty_arena_index = arena_index;
-                }
-            }
-            std.mem.sort(usize, to_remove.items, {}, comptime std.sort.desc(usize));
-            for (to_remove.items) |index| {
-                _ = arena_entry.entries_indexes.swapRemove(index);
+                arena.empty = false;
             }
         }
 
-        if (empty_arena_index) |arena_index| {
-            self.active_arena = arena_index;
-        } else {
-            _ = try self.makeArena();
-        }
-        const arena_idx = try self.getArenaIndex();
-        self.rng.shuffle(usize, unlocked_entry_list.items);
-        (&self.arenas.items[arena_idx]).empty = false;
-        try (&self.arenas.items[arena_idx]).entries_indexes.appendSlice(unlocked_entry_list.items);
-        const allocator = (&self.arenas.items[arena_idx]).allocator();
-        for (unlocked_entry_list.items) |entry_index| {
-            const entry: *MemoryEntry = &self.mem_entry_array.items[entry_index];
-            const new_ptr = try allocator.alloc(u8, entry.size);
-            // std.debug.print("MEMCPY {*} <- {*}\n", .{ new_ptr, entry.ptr });
-            @memcpy(new_ptr, @as([*]u8, @ptrCast(entry.ptr))[0..entry.size]);
-            entry.ptr = new_ptr.ptr;
-            self.handle_to_index.getEntry(entry.handle).?.value_ptr.* = entry_index;
-        }
-        std.mem.sort(usize, to_clear_list.items, {}, comptime std.sort.desc(usize));
-        for (to_clear_list.items) |victim| {
-            const last = self.mem_entry_array.items.len - 1;
-
-            // Remove from handle map
-            _ = self.handle_to_index.remove(self.mem_entry_array.items[victim].handle);
-
-            // If we're swapping something into the removed slot:
-            if (victim != last) {
-                // Update handle_to_index map to reflect the new position
-                const moved_handle = self.mem_entry_array.items[last].handle;
-                self.handle_to_index.put(moved_handle, victim) catch unreachable;
-
-                // Update every external reference (each arena) from "last" to "victim"
-                for (self.arenas.items) |*arena| {
-                    for (arena.entries_indexes.items) |*idx| {
-                        if (idx.* == last) idx.* = victim;
-                    }
-                }
+        // Pick a destination arena (reuse an empty one or create a new one)
+        const dest_idx = blk: {
+            for (self.arenas.items, 0..) |arena, idx| {
+                if (arena.empty) break :blk idx;
             }
+            try self.makeArena();
+            break :blk self.active_arena;
+        };
 
-            // Actually remove from mem_entry_array
-            _ = self.mem_entry_array.swapRemove(victim);
+        var dest_arena = &self.arenas.items[dest_idx];
+        dest_arena.empty = false;
+
+        // Move the survivors
+        const allocator = dest_arena.allocator();
+        for (unlocked.items) |h| {
+            const entry_ptr = self.mem_entries.getPtr(h).?;
+            const old_bytes = @as([*]u8, @ptrCast(entry_ptr.ptr))[0..entry_ptr.size];
+
+            // Over-allocate and align the destination pointer at runtime
+            const extra = entry_ptr.alignment - 1;
+            const new_bytes = try allocator.alloc(u8, entry_ptr.size + extra);
+
+            const base_addr = @intFromPtr(new_bytes.ptr);
+            const aligned_addr = std.mem.alignForward(usize, base_addr, entry_ptr.alignment);
+            const dst_ptr = @as(*u8, @ptrFromInt(aligned_addr));
+            const dst_bytes = @as([*]u8, @ptrCast(dst_ptr))[0..entry_ptr.size];
+
+            @memcpy(dst_bytes, old_bytes);
+
+            entry_ptr.ptr = @ptrCast(dst_ptr);
+            try dest_arena.entries.put(h, {});
         }
 
+        // Finally clear deleted handles
+        for (to_clear.items) |h| {
+            _ = self.mem_entries.remove(h);
+        }
+
+        // Reset arenas that became empty
         for (arenas_to_reset.items) |idx| {
-            if (idx == arena_idx) continue;
-            var reset_arena = &self.arenas.items[idx];
-            _ = reset_arena.arena.reset(.retain_capacity);
+            if (idx == dest_idx) continue; // keep destination intact
+            _ = self.arenas.items[idx].arena.reset(.retain_capacity);
         }
+
+        self.active_arena = dest_idx;
+    }
+
+    fn xor_keystream(self: *Self, entry: *MemoryEntry) void {
+        var data = @as([*]u8, @ptrCast(entry.ptr))[0..entry.size];
+
+        var block: [16]u8 = undefined;
+        var ks: [16]u8 = undefined;
+
+        const salt = self.ctr_salt;
+        const h64: u64 = @intCast(entry.handle); // stable per entry
+        var off: usize = 0;
+        var ctr: u64 = 0;
+
+        while (off < data.len) : (ctr += 1) {
+            // Build counter block: [0..8)=salt, [8..16)=h64 ^ ctr
+            @memcpy(block[0..8], salt[0..8]);
+            std.mem.writeInt(u64, block[8..16], h64 ^ ctr, .little);
+
+            self.aesenc.encrypt(&ks, &block);
+
+            const take = @min(@as(usize, 16), data.len - off);
+            var i: usize = 0;
+            while (i < take) : (i += 1) {
+                data[off + i] ^= ks[i];
+            }
+            off += take;
+        }
+    }
+
+    fn encrypt_mementry(self: *Self, entry: *MemoryEntry) void {
+        if (entry.encrypted) return;
+        self.xor_keystream(entry);
+        entry.encrypted = true;
+    }
+
+    fn decrypt_mementry(self: *Self, entry: *MemoryEntry) void {
+        if (!entry.encrypted) return;
+        self.xor_keystream(entry);
+        entry.encrypted = false;
     }
 };
