@@ -56,10 +56,10 @@ pub fn main() !void {
     sh.free(h);
     try sh.shuffle();
 }
+```
 
 ---
 
-```
 ## API overview
 
 > The snippets below focus on the main surface area. See inline docs for details.
