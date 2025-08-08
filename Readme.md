@@ -1,25 +1,25 @@
-# mem_shuffer 
+# mem_shuffler
 
-*A tiny Zig library that "shuffles" heap allocations across arenas, with transparent (per‑entry) encryption and safe, typed access.*
+*A Zig library for **secure, relocatable, AES-encrypted heap allocations** — designed to protect sensitive memory from dumps, frustrate reverse-engineering, and harden software against cracking.*
 
 > **TL;DR**
 >
-> * Allocate with `alloc(T, n)` or `create(T)` and get back an opaque `Handle`.
-> * Temporarily borrow a typed pointer via `rentPointer(handle, *T)` and give it back with `returnPointer(handle)`.
-> * The shuffler can periodically **move** ("shuffle") unlocked entries across arenas to fight fragmentation and frustrate memory forensics.
-> * Data is **encrypted at rest**; it’s decrypted only while borrowed.
+> * Allocate memory via `alloc(T, n)` or `create(T)` and get back an opaque `Handle` — no direct pointers to leak.
+> * Memory is **encrypted at rest** with AES-CTR and decrypted only while borrowed.
+> * Periodically **shuffle** unlocked entries across arenas to break predictable layouts and resist memory forensics.
+> * Thread-safe, alignment-preserving, and equipped with key rotation for long-lived secrets.
 
 ---
 
 ## Features
 
-* **Opaque handles, not raw pointers.** Memory is referenced by `Handle` to make relocation safe.
-* **AES‑CTR at rest.** Each entry is encrypted/decrypted using a counter stream derived from a per‑process key and an 8‑byte salt (plus the handle as part of the counter). Pointers you borrow are auto‑decrypted; data is re‑encrypted on return.
-* **Shuffling/compaction.** Unlocked entries can be moved to a fresh arena during `shuffle()` (or automatically on borrow/return if enabled), reducing fragmentation and randomizing locations.
-* **Arena backed.** Uses `std.heap.ArenaAllocator` instances that can be reset when empty.
-* **Alignment preserved.** Runtime alignment is respected across moves.
-* **Thread‑safe.** All public operations are protected by a `std.Thread.Mutex`.
-* **Key rotation.** Swap the encryption key/salt at runtime via `rotateKey(...)` without losing data.
+* **Opaque handles, not raw pointers.** Prevents address leaks and enables safe relocation.
+* **AES‑CTR encryption at rest.** Protects against memory dumps, debugging, and forensic tools.
+* **Relocation/shuffling.** Moves unlocked entries across arenas to break memory snapshots and hinder static analysis.
+* **Arena-based allocator.** Bulk reset for empty arenas; reduces fragmentation.
+* **Alignment preserved.** Runtime alignment is maintained after shuffles.
+* **Thread-safe.** All state changes guarded by a mutex.
+* **Key rotation.** Swap encryption key/salt without losing data.
 
 ---
 
@@ -43,24 +43,23 @@ pub fn main() !void {
     {
         const p = sh.rentPointer(h, *u32);
         p.* = 0xDEADBEEF;
-        sh.returnPointer(h); // re‑encrypts and (optionally) shuffles
+        sh.returnPointer(h);
     }
 
-    // Later: read it back
+    // Read it back securely
     {
         const p = sh.rentPointer(h, *u32);
         try std.testing.expectEqual(@as(u32, 0xDEADBEEF), p.*);
         sh.returnPointer(h);
     }
 
-    // When done
-    sh.free(h);     // marks for clearing
-    try sh.shuffle(); // actually drops cleared entries, compacts arenas
+    sh.free(h);
+    try sh.shuffle();
 }
-```
 
 ---
 
+```
 ## API overview
 
 > The snippets below focus on the main surface area. See inline docs for details.
@@ -193,4 +192,4 @@ PRs and issues welcome! Please include a failing test when reporting a bug.
 
 ## License
 
-MIT (or your preferred license—update this section accordingly).
+MIT
