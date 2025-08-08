@@ -44,6 +44,10 @@ pub const Shuffler = struct {
     aesdec: AesDec = undefined,
     ctr_salt: [8]u8 = undefined,
 
+    // ───── NEW: thread-safety & toggles ─────
+    mu: std.Thread.Mutex = .{}, // protects all state
+    shuffle_on_borrow_return: bool = false,
+
     const Self = @This();
 
     // ──────────────────────────── construction ──────────────────────────────
@@ -62,11 +66,15 @@ pub const Shuffler = struct {
             .aesenc = Aes256.initEnc(key),
             .aesdec = Aes256.initDec(key),
             .ctr_salt = salt,
+            .mu = .{},
+            .shuffle_on_borrow_return = true,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // free arena memory
+        self.mu.lock();
+        defer self.mu.unlock();
+
         for (self.arenas.items) |*arena| {
             arena.entries.deinit();
             arena.arena.deinit();
@@ -76,9 +84,16 @@ pub const Shuffler = struct {
         self.mem_entries.deinit();
     }
 
+    // ─────────────── enable/disable shuffle at borrow/return ─────
+    pub fn setShuffleOnBorrowReturn(self: *Self, enable: bool) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.shuffle_on_borrow_return = enable;
+    }
+
     // ─────────────────────────────── handles ────────────────────────────────
     fn newHandle(self: *Self) Handle {
-        // Never hand out the Invalid sentinel
+        // caller holds lock
         if (self.next_handle == Invalid) self.next_handle += 1;
         const h: Handle = self.next_handle;
         self.next_handle += 1;
@@ -86,17 +101,21 @@ pub const Shuffler = struct {
     }
 
     pub fn validHandle(self: *Self, h: Handle) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
         return self.mem_entries.contains(h);
     }
 
     // ───────────────────────────── arenas ───────────────────────────────────
     fn getArenaIndex(self: *Self) !usize {
+        // caller holds lock
         if (self.arenas.items.len == 0)
             try self.makeArena();
         return self.active_arena;
     }
 
     fn makeArena(self: *Self) !void {
+        // caller holds lock
         const slot = try self.arenas.addOne();
         const arena_ptr = try self.parent_allocator.create(std.heap.ArenaAllocator);
         arena_ptr.* = std.heap.ArenaAllocator.init(self.parent_allocator);
@@ -113,7 +132,10 @@ pub const Shuffler = struct {
 
     // ────────────────────────────── allocation ──────────────────────────────
     pub fn alloc(self: *Self, comptime T: type, n: usize) !Handle {
-        if (n == 0) @panic("alloc(0‑byte)");
+        if (n == 0) @panic("alloc(0-byte)");
+
+        self.mu.lock();
+        defer self.mu.unlock();
 
         const arena_idx = try self.getArenaIndex();
         const ptr = try self.arenas.items[arena_idx].allocator().alloc(T, n);
@@ -127,16 +149,19 @@ pub const Shuffler = struct {
             .handle = h,
             .locked = false,
             .to_clear = false,
+            .encrypted = false,
         });
 
         try self.arenas.items[arena_idx].entries.put(h, {});
-
         self.arenas.items[arena_idx].empty = false;
         return h;
     }
 
     pub fn create(self: *Self, comptime T: type) !Handle {
-        if (@sizeOf(T) == 0) @panic("alloc(0‑byte)");
+        if (@sizeOf(T) == 0) @panic("alloc(0-byte)");
+
+        self.mu.lock();
+        defer self.mu.unlock();
 
         const arena_idx = try self.getArenaIndex();
         const ptr = try self.arenas.items[arena_idx].allocator().create(T);
@@ -150,6 +175,7 @@ pub const Shuffler = struct {
             .handle = h,
             .locked = false,
             .to_clear = false,
+            .encrypted = false,
         });
 
         try self.arenas.items[arena_idx].entries.put(h, {});
@@ -159,7 +185,9 @@ pub const Shuffler = struct {
 
     // ─────────────────────────────── free ───────────────────────────────────
     pub fn free(self: *Self, h: Handle) void {
-        if (!self.validHandle(h)) return;
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (!self.mem_entries.contains(h)) return;
         self.mem_entries.getPtr(h).?.to_clear = true;
     }
 
@@ -168,7 +196,12 @@ pub const Shuffler = struct {
         if (@typeInfo(P) != .pointer)
             @compileError("rentPointer needs a pointer type");
 
-        self.shuffle() catch unreachable;
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        if (self.shuffle_on_borrow_return) {
+            self.shuffleUnsafe() catch unreachable;
+        }
 
         const entry = self.mem_entries.getPtr(h) orelse @panic("Invalid handle");
         entry.locked = true;
@@ -178,21 +211,36 @@ pub const Shuffler = struct {
     }
 
     pub fn returnPointer(self: *Self, h: Handle) void {
-        if (!self.validHandle(h)) return;
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        if (!self.mem_entries.contains(h)) return;
         const entry = self.mem_entries.getPtr(h).?;
         self.encrypt_mementry(entry);
         entry.encrypted = true;
         entry.locked = false;
-        self.shuffle() catch unreachable;
+
+        if (self.shuffle_on_borrow_return) {
+            self.shuffleUnsafe() catch unreachable;
+        }
     }
 
     pub fn getSize(self: *Self, h: Handle) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
         const entry = self.mem_entries.get(h) orelse @panic("Invalid handle");
         return entry.size;
     }
 
     // ────────────────────────────  shuffle  ────────────────────────────────
     pub fn shuffle(self: *Self) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.shuffleUnsafe();
+    }
+
+    fn shuffleUnsafe(self: *Self) !void {
+        // caller holds lock
         if (self.mem_entries.count() == 0) return;
 
         var unlocked = std.ArrayList(Handle).init(self.parent_allocator);
@@ -204,7 +252,7 @@ pub const Shuffler = struct {
         var arenas_to_reset = std.ArrayList(usize).init(self.parent_allocator);
         defer arenas_to_reset.deinit();
 
-        // Collect unlocked or to‑clear entries from each arena
+        // Collect unlocked or to-clear entries from each arena
         for (self.arenas.items, 0..) |*arena, idx| {
             var iter = arena.entries.keyIterator();
             while (iter.next()) |handle_ptr| {
@@ -276,7 +324,9 @@ pub const Shuffler = struct {
         self.active_arena = dest_idx;
     }
 
+    // ─────────────────────────── key/stream helpers ─────────────────────────
     fn xor_keystream(self: *Self, entry: *MemoryEntry) void {
+        // caller holds lock
         var data = @as([*]u8, @ptrCast(entry.ptr))[0..entry.size];
 
         var block: [16]u8 = undefined;
@@ -314,4 +364,55 @@ pub const Shuffler = struct {
         self.xor_keystream(entry);
         entry.encrypted = false;
     }
+
+    // ───── NEW: key rotation ─────
+    pub fn rotateKey(self: *Self, new_key_opt: ?*const [32]u8, new_salt_opt: ?*const [8]u8) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        // // We can rotate while any entry is borrowed
+        // // since it is unencrypted
+        // var it = self.mem_entries.valueIterator();
+        // while (it.next()) |entry| {
+        //     if (entry.locked) return error.Busy;
+        // }
+
+        // Remember which entries were encrypted so we can restore state
+        var to_reencrypt = std.ArrayList(Handle).init(self.parent_allocator);
+        defer to_reencrypt.deinit();
+
+        var it2 = self.mem_entries.iterator();
+        while (it2.next()) |kv| {
+            const h = kv.key_ptr.*;
+            const entry_ptr = kv.value_ptr;
+            if (entry_ptr.encrypted) {
+                self.decrypt_mementry(entry_ptr);
+                try to_reencrypt.append(h);
+            }
+        }
+
+        var new_key: [32]u8 = undefined;
+        var new_salt: [8]u8 = undefined;
+
+        if (new_key_opt) |k| {
+            new_key = k.*;
+        } else {
+            std.crypto.random.bytes(@as([*]u8, @ptrCast(&new_key))[0..32]);
+        }
+        if (new_salt_opt) |s| {
+            new_salt = s.*;
+        } else {
+            std.crypto.random.bytes(&new_salt);
+        }
+
+        self.aesenc = Aes256.initEnc(new_key);
+        self.aesdec = Aes256.initDec(new_key);
+        self.ctr_salt = new_salt;
+
+        for (to_reencrypt.items) |h| {
+            const entry_ptr = self.mem_entries.getPtr(h).?;
+            self.encrypt_mementry(entry_ptr);
+        }
+    }
 };
+
