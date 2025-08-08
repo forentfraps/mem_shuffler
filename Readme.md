@@ -193,4 +193,4 @@ PRs and issues welcome! Please include a failing test when reporting a bug.
 
 ## License
 
-MIT (or your preferred license—update this section accordingly).
+MIT
