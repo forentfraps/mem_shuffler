@@ -49,8 +49,8 @@ test "fuzz shuffler random actions" {
         var sh = try root.Shuffler.init(gpa);
         defer sh.deinit();
 
-        var live = std.ArrayList(root.Handle).init(gpa);
-        defer live.deinit();
+        var live = try std.ArrayList(root.Handle).initCapacity(gpa, 1);
+        defer live.deinit(gpa);
 
         var seed: u64 = undefined;
         std.crypto.random.bytes(@as([*]u8, @ptrCast(&seed))[0..8]);
@@ -64,11 +64,11 @@ test "fuzz shuffler random actions" {
                 0 => {
                     // Allocate 1–128 bytes
                     const size: usize = ((b >> 2) & 0x7f) + 1;
-                    try live.append(try sh.alloc(u8, size));
+                    try live.append(gpa, try sh.alloc(u8, size));
                 },
                 1 => {
                     // Create a Foo object
-                    try live.append(try sh.create(Foo));
+                    try live.append(gpa, try sh.create(Foo));
                 },
                 2 => if (live.items.len > 0) {
                     // Free a random live allocation
@@ -109,8 +109,8 @@ test "shuffler integrity" {
         var rng = std.Random.DefaultPrng.init(0xCAFEBABE);
         const r = rng.random();
 
-        var dummies = std.ArrayList(root.Handle).init(gpa);
-        defer dummies.deinit();
+        var dummies = try std.ArrayList(root.Handle).initCapacity(gpa, 1);
+        defer dummies.deinit(gpa);
 
         const outer = 50; // number of shuffle rounds
         for (0..outer) |round| {
@@ -118,7 +118,7 @@ test "shuffler integrity" {
             const new_count = r.uintLessThan(usize, 8) + 2;
             for (0..new_count) |_| {
                 const sz: usize = r.uintLessThan(usize, 64) + 1;
-                try dummies.append(try sh.alloc(u8, sz));
+                try dummies.append(gpa, try sh.alloc(u8, sz));
             }
 
             // Randomly free a few of them (marking for clear)
@@ -278,9 +278,12 @@ test "concurrent alloc/rent/return smoke" {
         const Worker = struct {
             sh: *root.Shuffler,
             iters: usize,
-            fn run(self: *@This()) !void {
-                var handles = std.ArrayList(root.Handle).init(std.heap.page_allocator);
-                defer handles.deinit();
+
+            const Self = @This();
+
+            fn run(self: *Self) !void {
+                var handles = try std.ArrayList(root.Handle).initCapacity(std.testing.allocator, 1);
+                defer handles.deinit(std.testing.allocator);
 
                 var prng = std.Random.DefaultPrng.init(0xBEEF_F00D ^ @intFromPtr(self));
                 const r = prng.random();
@@ -289,7 +292,7 @@ test "concurrent alloc/rent/return smoke" {
                 while (i < self.iters) : (i += 1) {
                     const op = r.uintLessThan(u8, 4);
                     switch (op) {
-                        0 => try handles.append(try self.sh.alloc(u8, r.uintLessThan(usize, 64) + 1)),
+                        0 => try handles.append(std.testing.allocator, try self.sh.alloc(u8, r.uintLessThan(usize, 64) + 1)),
                         1 => if (handles.items.len > 0) {
                             const idx = r.uintLessThan(usize, handles.items.len);
                             const h = handles.items[idx];
