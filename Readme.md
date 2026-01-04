@@ -180,8 +180,6 @@ Add the package to your `build.zig` and import it:
 const root = @import("mem_shuffle_lib");
 ```
 
-> If you vendored the code, adjust the path accordingly. (A Zig package manager snippet can be added once published.)
-
 ---
 
 ## Contributing
