@@ -42,21 +42,22 @@ pub const Shuffler = struct {
     /// Monotonically–increasing counter for new handles
     next_handle: Handle = 0,
     /// Aes context and related stuff to encrypt and decrypt
+    io: std.Io = undefined,
     aesenc: AesEnc = undefined,
     aesdec: AesDec = undefined,
     ctr_salt: [8]u8 = undefined,
 
-    mu: std.Thread.Mutex = .{}, // protects all state
+    mu: std.Io.Mutex = .{ .state = .{ .raw = .unlocked } }, // protects all state
     shuffle_on_borrow_return: bool = false,
 
     const Self = @This();
 
     // ──────────────────────────── construction ──────────────────────────────
-    pub fn init(allocator: std.mem.Allocator) !Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Self {
         var key: [32]u8 = undefined;
-        std.crypto.random.bytes(@as([*]u8, @ptrCast(&key))[0..32]);
+        std.Io.random(io, @as([*]u8, @ptrCast(&key))[0..32]);
         var salt: [8]u8 = undefined;
-        std.crypto.random.bytes(&salt);
+        std.Io.random(io, &salt);
 
         return .{
             .parent_allocator = allocator,
@@ -67,14 +68,15 @@ pub const Shuffler = struct {
             .aesenc = Aes256.initEnc(key),
             .aesdec = Aes256.initDec(key),
             .ctr_salt = salt,
-            .mu = .{},
+            .mu = .{ .state = .{ .raw = .unlocked } },
+            .io = io,
             .shuffle_on_borrow_return = true,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
 
         for (self.arenas.items) |*arena| {
             arena.entries.deinit();
@@ -87,8 +89,8 @@ pub const Shuffler = struct {
 
     // ─────────────── enable/disable shuffle at borrow/return ─────
     pub fn setShuffleOnBorrowReturn(self: *Self, enable: bool) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
         self.shuffle_on_borrow_return = enable;
     }
 
@@ -102,8 +104,8 @@ pub const Shuffler = struct {
     }
 
     pub fn validHandle(self: *Self, h: Handle) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io);
+        defer self.mu.unlock(self.io);
         return self.mem_entries.contains(h);
     }
 
@@ -135,8 +137,8 @@ pub const Shuffler = struct {
     pub fn alloc(self: *Self, comptime T: type, n: usize) !Handle {
         if (n == 0) @panic("alloc(0-byte)");
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
 
         const arena_idx = try self.getArenaIndex();
         const ptr = try self.arenas.items[arena_idx].allocator().alloc(T, n);
@@ -161,8 +163,8 @@ pub const Shuffler = struct {
     pub fn create(self: *Self, comptime T: type) !Handle {
         if (@sizeOf(T) == 0) @panic("alloc(0-byte)");
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
 
         const arena_idx = try self.getArenaIndex();
         const ptr = try self.arenas.items[arena_idx].allocator().create(T);
@@ -186,8 +188,8 @@ pub const Shuffler = struct {
 
     // ─────────────────────────────── free ───────────────────────────────────
     pub fn free(self: *Self, h: Handle) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
         if (!self.mem_entries.contains(h)) return;
         self.mem_entries.getPtr(h).?.to_clear = true;
     }
@@ -197,8 +199,8 @@ pub const Shuffler = struct {
         if (@typeInfo(P) != .pointer)
             @compileError("rentPointer needs a pointer type");
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
 
         if (self.shuffle_on_borrow_return) {
             self.shuffleUnsafe() catch unreachable;
@@ -212,8 +214,8 @@ pub const Shuffler = struct {
     }
 
     pub fn returnPointer(self: *Self, h: Handle) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
 
         if (!self.mem_entries.contains(h)) return;
         const entry = self.mem_entries.getPtr(h).?;
@@ -227,16 +229,16 @@ pub const Shuffler = struct {
     }
 
     pub fn getSize(self: *Self, h: Handle) usize {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
         const entry = self.mem_entries.get(h) orelse @panic("Invalid handle");
         return entry.size;
     }
 
     // ────────────────────────────  shuffle  ────────────────────────────────
     pub fn shuffle(self: *Self) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
         try self.shuffleUnsafe();
     }
 
@@ -367,8 +369,8 @@ pub const Shuffler = struct {
     }
 
     pub fn rotateKey(self: *Self, new_key_opt: ?*const [32]u8, new_salt_opt: ?*const [8]u8) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(self.io) catch unreachable;
+        defer self.mu.unlock(self.io);
 
         // // We can rotate while any entry is borrowed
         // // since it is unencrypted
@@ -397,12 +399,12 @@ pub const Shuffler = struct {
         if (new_key_opt) |k| {
             new_key = k.*;
         } else {
-            std.crypto.random.bytes(@as([*]u8, @ptrCast(&new_key))[0..32]);
+            std.Io.random(self.io, @as([*]u8, @ptrCast(&new_key))[0..32]);
         }
         if (new_salt_opt) |s| {
             new_salt = s.*;
         } else {
-            std.crypto.random.bytes(&new_salt);
+            std.Io.random(self.io, &new_salt);
         }
 
         self.aesenc = Aes256.initEnc(new_key);

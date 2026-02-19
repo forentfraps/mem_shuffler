@@ -9,8 +9,8 @@ const Foo = struct {
 fn invariant(sh: *root.Shuffler) !void {
     const t = std.testing;
 
-    sh.mu.lock();
-    defer sh.mu.unlock();
+    sh.mu.lock(t.io) catch unreachable;
+    defer sh.mu.unlock(t.io);
 
     var it = sh.mem_entries.iterator();
     while (it.next()) |kv| {
@@ -46,14 +46,14 @@ test "fuzz shuffler random actions" {
     const gpa = dbg.allocator();
 
     {
-        var sh = try root.Shuffler.init(gpa);
+        var sh = try root.Shuffler.init(gpa, std.testing.io);
         defer sh.deinit();
 
         var live = try std.ArrayList(root.Handle).initCapacity(gpa, 1);
         defer live.deinit(gpa);
 
         var seed: u64 = undefined;
-        std.crypto.random.bytes(@as([*]u8, @ptrCast(&seed))[0..8]);
+        std.Io.random(std.testing.io, @as([*]u8, @ptrCast(&seed))[0..8]);
         var prng = std.Random.DefaultPrng.init(seed);
         const r = prng.random();
 
@@ -87,14 +87,14 @@ test "fuzz shuffler random actions" {
             try invariant(&sh);
         }
     }
-    if (dbg.detectLeaks()) std.debug.print("Memory leaks detected\n", .{});
+    if (dbg.detectLeaks() != 0) std.debug.print("Memory leaks detected\n", .{});
 }
 
 test "shuffler integrity" {
     var dbg = std.heap.DebugAllocator(.{}){};
     const gpa = dbg.allocator();
     {
-        var sh = try root.Shuffler.init(gpa);
+        var sh = try root.Shuffler.init(gpa, std.testing.io);
         defer sh.deinit();
 
         // The primary allocation we will keep checking
@@ -144,7 +144,7 @@ test "shuffler integrity" {
         for (dummies.items) |h| sh.free(h);
         sh.shuffle() catch unreachable; // finish the clears
     }
-    if (dbg.detectLeaks()) std.debug.print("Memory leaks detected\n", .{});
+    if (dbg.detectLeaks() != 0) std.debug.print("Memory leaks detected\n", .{});
 }
 
 test "aligned rent stays aligned across shuffles" {
@@ -152,7 +152,7 @@ test "aligned rent stays aligned across shuffles" {
     const gpa = dbg.allocator();
 
     {
-        var sh = try root.Shuffler.init(gpa);
+        var sh = try root.Shuffler.init(gpa, std.testing.io);
         defer sh.deinit();
 
         const h64 = try sh.alloc(u64, 1);
@@ -173,14 +173,14 @@ test "aligned rent stays aligned across shuffles" {
         sh.returnPointer(hF);
     }
 
-    if (dbg.detectLeaks()) std.debug.print("Memory leaks detected\n", .{});
+    if (dbg.detectLeaks() != 0) std.debug.print("Memory leaks detected\n", .{});
 }
 
 test "locked entry pointer stable across shuffle" {
     var dbg = std.heap.DebugAllocator(.{}){};
     const gpa = dbg.allocator();
     {
-        var sh = try root.Shuffler.init(gpa);
+        var sh = try root.Shuffler.init(gpa, std.testing.io);
         defer sh.deinit();
 
         const h = try sh.alloc(u32, 1);
@@ -202,11 +202,11 @@ test "locked entry pointer stable across shuffle" {
         sh.returnPointer(h);
     }
 
-    if (dbg.detectLeaks()) std.debug.print("Memory leaks detected\n", .{});
+    if (dbg.detectLeaks() != 0) std.debug.print("Memory leaks detected\n", .{});
 }
 
 test "shuffle on return enabled -> pointer likely moves" {
-    var sh = try root.Shuffler.init(std.testing.allocator);
+    var sh = try root.Shuffler.init(std.testing.allocator, std.testing.io);
     defer sh.deinit();
 
     sh.setShuffleOnBorrowReturn(true);
@@ -226,7 +226,7 @@ test "shuffle on return enabled -> pointer likely moves" {
 }
 
 test "rotateKey preserves data and re-encrypts entries" {
-    var sh = try root.Shuffler.init(std.testing.allocator);
+    var sh = try root.Shuffler.init(std.testing.allocator, std.testing.io);
     defer sh.deinit();
 
     // Write a value
@@ -264,7 +264,7 @@ test "concurrent alloc/rent/return smoke" {
     var dbg = std.heap.DebugAllocator(.{}){};
     const gpa = dbg.allocator();
     {
-        var sh = try root.Shuffler.init(gpa);
+        var sh = try root.Shuffler.init(gpa, std.testing.io);
         defer sh.deinit();
 
         sh.setShuffleOnBorrowReturn(true);
@@ -326,5 +326,5 @@ test "concurrent alloc/rent/return smoke" {
         try invariant(&sh);
     }
 
-    if (dbg.detectLeaks()) std.debug.print("Memory leaks detected\n", .{});
+    if (dbg.detectLeaks() != 0) std.debug.print("Memory leaks detected\n", .{});
 }
